@@ -1,0 +1,13 @@
+{
+  "name": "3x4 min sweet spot",
+  "ftp": 200,
+  "steps": [
+    {"name": "Warmup",     "seconds": 300, "pct_ftp": 50},
+    {"name": "Interval 1", "seconds": 240, "pct_ftp": 90},
+    {"name": "Recovery 1", "seconds": 180, "pct_ftp": 55},
+    {"name": "Interval 2", "seconds": 240, "pct_ftp": 90},
+    {"name": "Recovery 2", "seconds": 180, "pct_ftp": 55},
+    {"name": "Interval 3", "seconds": 240, "pct_ftp": 90},
+    {"name": "Cooldown",   "seconds": 300, "watts": 100}
+  ]
+}
