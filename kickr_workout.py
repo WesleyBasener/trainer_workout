@@ -42,7 +42,8 @@ OP_SET_TARGET_POWER = 0x05
 OP_START = 0x07
 OP_STOP = 0x08
 RESULT_SUCCESS = 0x01
-
+OP_SET_TARGET_RESISTANCE = 0x04
+OP_SET_SIMULATION = 0x11
 
 # --------------------------------------------------------------------------
 # Workout file handling
@@ -51,8 +52,18 @@ RESULT_SUCCESS = 0x01
 @dataclass
 class Step:
     name: str
-    watts: int
     seconds: int
+    watts: int | None = None
+    grade: float | None = None         # % grade (simulation mode)
+    resistance: float | None = None    # FTMS resistance level
+
+    @property
+    def target(self) -> str:
+        if self.watts is not None:
+            return f"{self.watts} W"
+        if self.grade is not None:
+            return f"{self.grade:g}% grade"
+        return f"resistance {self.resistance:g}"
 
 
 def load_workout(path: str, ftp_override: int | None) -> tuple[str, list[Step]]:
@@ -62,16 +73,20 @@ def load_workout(path: str, ftp_override: int | None) -> tuple[str, list[Step]]:
     ftp = ftp_override or spec.get("ftp")
     steps = []
     for i, s in enumerate(spec["steps"], start=1):
+        name, seconds = s.get("name", f"Step {i}"), int(s["seconds"])
         if "watts" in s:
-            watts = int(s["watts"])
+            steps.append(Step(name, seconds, watts=int(s["watts"])))
         elif "pct_ftp" in s:
             if not ftp:
                 raise SystemExit(f"Step {i} uses pct_ftp but no FTP is set "
                                  "(add 'ftp' to the file or pass --ftp).")
-            watts = round(ftp * s["pct_ftp"] / 100)
+            steps.append(Step(name, seconds, watts=round(ftp * s["pct_ftp"] / 100)))
+        elif "grade" in s:
+            steps.append(Step(name, seconds, grade=float(s["grade"])))
+        elif "resistance" in s:
+            steps.append(Step(name, seconds, resistance=float(s["resistance"])))
         else:
-            raise SystemExit(f"Step {i} needs either 'watts' or 'pct_ftp'.")
-        steps.append(Step(s.get("name", f"Step {i}"), watts, int(s["seconds"])))
+            raise SystemExit(f"Step {i} needs 'watts', 'pct_ftp', 'grade' or 'resistance'.")
     return spec.get("name", Path(path).stem), steps
 
 
@@ -170,6 +185,28 @@ class Trainer:
     async def stop(self) -> None:
         await self.command(OP_STOP, b"\x01")   # 0x01 = stop (0x02 = pause)
 
+    async def set_resistance_level(self, level: float) -> None:
+        """FTMS target resistance (uint8, 0.1 units). Support varies by trainer."""
+        await self.command(OP_SET_TARGET_RESISTANCE, struct.pack("<B", round(level * 10)))
+
+    async def set_simulation(self, grade_pct: float, crr: float = 0.004,
+                             cw: float = 0.51, wind_mps: float = 0.0) -> None:
+        """Simulate a road grade. crr and cw are the usual FTMS defaults
+        (rolling resistance, wind resistance coefficient)."""
+        params = struct.pack("<hhBB",
+                             round(wind_mps * 1000),   # sint16, 0.001 m/s
+                             round(grade_pct * 100),   # sint16, 0.01 %
+                             round(crr * 10000),       # uint8, 0.0001
+                             round(cw * 100))          # uint8, 0.01 kg/m
+        await self.command(OP_SET_SIMULATION, params)
+
+    async def apply_step(self, step: "Step") -> None:
+        if step.watts is not None:
+            await self.set_power(step.watts)
+        elif step.grade is not None:
+            await self.set_simulation(step.grade)
+        else:
+            await self.set_resistance_level(step.resistance)
 
 # --------------------------------------------------------------------------
 # Device discovery
@@ -182,7 +219,7 @@ async def find_devices(args):
     def on_detect(dev, adv):
         name = dev.name or adv.local_name or ""
         uuids = {u.lower() for u in adv.service_uuids}
-        print(f"{name} {uuids}")
+        
         if found["trainer"] is None and args.trainer_name.lower() in name.lower():
             found["trainer"] = dev
             print(f"  found trainer: {name} ({dev.address})")
@@ -268,9 +305,9 @@ async def run(args) -> None:
             step_end = t0
             for idx, step in enumerate(steps, start=1):
                 step_end += step.seconds          # cumulative, so no drift
-                await trainer.set_power(step.watts)
+                await trainer.apply_step(step)
                 print(f"\n>>> Step {idx}/{len(steps)}: {step.name}, "
-                      f"{step.watts} W for {step.seconds}s")
+                    f"{step.target} for {step.seconds}s")
 
                 while (now := time.monotonic()) < step_end:
                     if lost.is_set():
