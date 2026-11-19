@@ -2,7 +2,8 @@
   "name": "3x4 min sweet spot",
   "ftp": 200,
   "steps": [
-    {"name": "Hill",   "seconds": 120, "grade": 6},
-    {"name": "Easy",   "seconds": 60,  "resistance": 3}
+    {"name": "Warmup", "seconds": 20, "pct_ftp": 50},
+    {"name": "Hill",   "seconds": 30, "grade": 6},
+    {"name": "Easy",   "seconds": 40,  "resistance": 3}
   ]
 }

@@ -297,7 +297,7 @@ async def run(args) -> None:
 
         csv_file = stack.enter_context(open(csv_path, "w", newline=""))
         writer = csv.writer(csv_file)
-        writer.writerow(["timestamp", "elapsed_s", "step", "target_w",
+        writer.writerow(["timestamp", "elapsed_s", "step", "target",
                          "power_w", "cadence_rpm", "speed_kmh", "hr_bpm"])
 
         try:
@@ -315,13 +315,13 @@ async def run(args) -> None:
 
                     writer.writerow([
                         datetime.now().isoformat(timespec="seconds"),
-                        f"{now - t0:.1f}", step.name, step.watts,
+                        f"{now - t0:.1f}", step.name, step.target,
                         state["power"], state["cadence"],
                         state["speed_kmh"], state["hr"],
                     ])
                     csv_file.flush()
 
-                    print(f"\r  {step_end - now:4.0f}s left | target {step.watts:3d} W | "
+                    print(f"\r  {step_end - now:4.0f}s left | target {step.target:>12} | "
                           f"power {fmt(state['power']):>4} W | "
                           f"cadence {fmt(state['cadence']):>3} | "
                           f"HR {fmt(state['hr']):>3}   ", end="", flush=True)
