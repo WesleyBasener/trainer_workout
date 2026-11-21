@@ -12,6 +12,11 @@ Usage:
     python kickr_dashboard.py sample_workout.json --no-hr
     python kickr_dashboard.py sample_workout.json --demo      # no hardware needed
 
+Workout file: each step has ONE length ('seconds', 'meters', 'km' or 'miles') and
+at least one of 'watts', 'pct_ftp', 'grade', 'resistance'. A step with a power
+target ('watts'/'pct_ftp') may also carry 'grade' and/or 'resistance'; for now
+those are only shown in the Live panel (they are not sent to the trainer).
+
 Keys:  n = next step    r = restart step (or previous step if <2 s in)
        p = pause/play   q (or Ctrl+Q) = stop workout and quit
 
@@ -66,13 +71,28 @@ RESULT_SUCCESS = 0x01
 @dataclass
 class Step:
     name: str
-    seconds: int
-    watts: int | None = None
-    grade: float | None = None         # % grade (simulation mode)
+    seconds: int | None = None         # time-based length, or...
+    meters: float | None = None        # ...distance-based length
+    watts: int | None = None           # ERG target power
+    grade: float | None = None         # % grade
     resistance: float | None = None    # FTMS resistance level
 
     @property
+    def is_distance(self) -> bool:
+        return self.meters is not None
+
+    @property
+    def length(self) -> float:
+        """Step length in its own unit: seconds, or meters for distance steps."""
+        return self.meters if self.is_distance else self.seconds
+
+    @property
+    def length_str(self) -> str:
+        return dist_str(self.meters) if self.is_distance else mmss(self.seconds)
+
+    @property
     def target(self) -> str:
+        """What is commanded to the trainer for this step."""
         if self.watts is not None:
             return f"{self.watts} W"
         if self.grade is not None:
@@ -80,27 +100,50 @@ class Step:
         return f"resistance {self.resistance:g}"
 
 
+LENGTH_UNITS = {"seconds": None, "meters": 1.0, "km": 1000.0, "miles": 1609.344}
+
+
 def load_workout(path: str, ftp_override: int | None) -> tuple[str, list[Step]]:
-    """Read a workout JSON file. Each step has 'seconds' plus one of:
-    'watts', 'pct_ftp' (relative to the FTP in the file/CLI), 'grade', 'resistance'."""
+    """Read a workout JSON file.
+
+    Each step needs exactly one length key ('seconds', 'meters', 'km' or
+    'miles') and at least one of 'watts', 'pct_ftp' (relative to the FTP in the
+    file/CLI), 'grade' or 'resistance'. Power can be combined with grade and/or
+    resistance; a step without power is driven by its grade (else resistance).
+    """
     spec = json.loads(Path(path).read_text())
     ftp = ftp_override or spec.get("ftp")
     steps = []
     for i, s in enumerate(spec["steps"], start=1):
-        name, seconds = s.get("name", f"Step {i}"), int(s["seconds"])
+        name = s.get("name", f"Step {i}")
+
+        lengths = [k for k in LENGTH_UNITS if k in s]
+        if len(lengths) != 1:
+            raise SystemExit(f"Step {i} needs exactly one of 'seconds', 'meters', "
+                             "'km' or 'miles'.")
+        key = lengths[0]
+        amount = float(s[key])
+        if amount <= 0:
+            raise SystemExit(f"Step {i}: '{key}' must be greater than zero.")
+        length = ({"seconds": round(amount)} if key == "seconds"
+                  else {"meters": amount * LENGTH_UNITS[key]})
+
+        if "watts" in s and "pct_ftp" in s:
+            raise SystemExit(f"Step {i} has both 'watts' and 'pct_ftp'; use one.")
+        watts = None
         if "watts" in s:
-            steps.append(Step(name, seconds, watts=int(s["watts"])))
+            watts = int(s["watts"])
         elif "pct_ftp" in s:
             if not ftp:
                 raise SystemExit(f"Step {i} uses pct_ftp but no FTP is set "
                                  "(add 'ftp' to the file or pass --ftp).")
-            steps.append(Step(name, seconds, watts=round(ftp * s["pct_ftp"] / 100)))
-        elif "grade" in s:
-            steps.append(Step(name, seconds, grade=float(s["grade"])))
-        elif "resistance" in s:
-            steps.append(Step(name, seconds, resistance=float(s["resistance"])))
-        else:
+            watts = round(ftp * s["pct_ftp"] / 100)
+        grade = float(s["grade"]) if "grade" in s else None
+        resistance = float(s["resistance"]) if "resistance" in s else None
+        if watts is None and grade is None and resistance is None:
             raise SystemExit(f"Step {i} needs 'watts', 'pct_ftp', 'grade' or 'resistance'.")
+
+        steps.append(Step(name, watts=watts, grade=grade, resistance=resistance, **length))
     return spec.get("name", Path(path).stem), steps
 
 
@@ -337,6 +380,11 @@ def mmss(seconds: float) -> str:
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
+def dist_str(meters: float) -> str:
+    meters = max(0.0, meters)
+    return f"{meters / 1000:.2f} km" if meters >= 1000 else f"{meters:.0f} m"
+
+
 def val(v, spec="{:.0f}") -> str:
     return "--" if v is None else spec.format(v)
 
@@ -367,16 +415,25 @@ class DashboardApp(App):
         self.cli = cli
         self.workout_name = workout_name
         self.plan = plan
-        self.plan_start = []                  # start time (s) of each step
-        t = 0
-        for s in plan:
-            self.plan_start.append(t)
-            t += s.seconds
-        self.total_s = t
 
+        # How progress is shown depends on the kinds of steps in the plan:
+        #   time     -> step left / total left / bar in time
+        #   distance -> step left / total left / bar in distance
+        #   mixed    -> only "step left"; total left and the bar are dropped
+        kinds = {s.is_distance for s in plan}
+        self.mode = "distance" if kinds == {True} else "time" if kinds == {False} else "mixed"
+        self.unit_start = []                  # where each step starts, in the mode's unit
+        t = 0.0
+        for s in plan:
+            self.unit_start.append(t)
+            t += s.length
+        self.total_units = t                  # seconds or meters (not used when mixed)
 
         self.live = {"power": None, "cadence": None, "speed_kmh": None, "hr": None}
-        self.hist_t: list[float] = []         # minutes along the workout plan
+        self.elapsed_s = 0.0                  # unpaused workout time
+        self.dist_m = 0.0                     # distance, integrated from trainer speed
+        self.hist_t: list[float] = []         # minutes of elapsed workout time
+        self.hist_target: list[float | None] = []   # commanded watts (None if not ERG)
         self.hist_power: list[float | None] = []
         self.hist_hr: list[float | None] = []
         self.hist_cad: list[float | None] = []
@@ -402,7 +459,8 @@ class DashboardApp(App):
             with Vertical(id="charts"):
                 yield PlotextPlot(id="power_plot")
                 yield PlotextPlot(id="hr_plot")
-        yield ProgressBar(total=self.total_s, show_eta=False, id="overall")
+        yield ProgressBar(total=self.total_units if self.mode != "mixed" else 1,
+                          show_eta=False, id="overall")
         yield RichLog(id="log", wrap=True, markup=False, highlight=False)
         yield Footer()
 
@@ -412,6 +470,8 @@ class DashboardApp(App):
         self.query_one("#stats").border_title = "Live"
         self.query_one("#steps").border_title = "Plan"
         self.query_one("#log").border_title = "Log"
+        if self.mode == "mixed":
+            self.query_one("#overall").display = False
         self.render_all(None, 0, 0, 0)
         self.run_worker(self.run_session(), exclusive=True)
 
@@ -449,13 +509,16 @@ class DashboardApp(App):
 
     # ---- rendering --------------------------------------------------------
 
-    def render_all(self, step, idx, remaining, plan_t) -> None:
-        self.render_stats(step, idx, remaining, plan_t)
+    def render_all(self, step, idx, remaining, done) -> None:
+        """remaining: left in the current step (its own unit). done: progress through
+        the whole plan in the mode's unit (None when the plan mixes time and distance)."""
+        self.render_stats(step, idx, remaining, done)
         self.render_steps(idx)
-        self.render_charts(plan_t / 60)
-        self.query_one("#overall", ProgressBar).update(progress=plan_t)
+        self.render_charts(self.elapsed_s / 60, step, idx, remaining)
+        if self.mode != "mixed":
+            self.query_one("#overall", ProgressBar).update(progress=done)
 
-    def render_stats(self, step, idx, remaining, plan_t) -> None:
+    def render_stats(self, step, idx, remaining, done) -> None:
         d = self.live
         target_w = step.watts if step else None
         style = "bold"
@@ -472,6 +535,8 @@ class DashboardApp(App):
         t.append(f"{val(d['hr']):>5} bpm\n", "bold red")
         t.append("SPEED    ", "dim")
         t.append(f"{val(d['speed_kmh'], '{:.1f}'):>5} km/h\n", "bold")
+        t.append("DISTANCE ", "dim")
+        t.append(f"{dist_str(self.dist_m):>8}\n", "bold")
         if self.paused:
             t.append("\n")
             t.append("** PAUSED ** (p to resume)\n", "bold reverse yellow")
@@ -479,12 +544,23 @@ class DashboardApp(App):
             t.append("\n")
             t.append(f"Step {idx + 1}/{len(self.plan)}: ", "dim")
             t.append(f"{step.name}\n", "bold")
-            t.append("Target     ", "dim")
-            t.append(f"{step.target}\n", "bold orange1")
-            t.append("Step left  ", "dim")
-            t.append(f"{mmss(remaining)}\n")
-            t.append("Total left ", "dim")
-            t.append(f"{mmss(self.total_s - plan_t)}")
+
+            rows = [("Target     ", step.target, "bold orange1")]
+            if step.watts is not None:
+                # Display-only for now: grade/resistance alongside a power target.
+                if step.grade is not None:
+                    rows.append(("Grade      ", f"{step.grade:g} %", "bold"))
+                if step.resistance is not None:
+                    rows.append(("Resistance ", f"{step.resistance:g}", "bold"))
+            rows.append(("Step left  ",
+                         dist_str(remaining) if step.is_distance else mmss(remaining), ""))
+            if self.mode == "time":
+                rows.append(("Total left ", mmss(self.total_units - done), ""))
+            elif self.mode == "distance":
+                rows.append(("Total left ", dist_str(self.total_units - done), ""))
+            for n, (label, text, sty) in enumerate(rows):
+                t.append(label, "dim")
+                t.append(text + ("\n" if n < len(rows) - 1 else ""), sty)
         self.query_one("#stats", Static).update(t)
 
     def render_steps(self, idx: int) -> None:
@@ -492,7 +568,7 @@ class DashboardApp(App):
         lo = max(0, idx - 1)
         for i in range(lo, min(len(self.plan), lo + 12)):
             s = self.plan[i]
-            line = f"{'>' if i == idx else ' '}{i + 1:>2} {s.name[:12]:<12} {mmss(s.seconds):>5} {s.target}\n"
+            line = f"{'>' if i == idx else ' '}{i + 1:>2} {s.name[:12]:<12} {s.length_str:>8} {s.target}\n"
             t.append(line, "bold" if i == idx else "dim" if i < idx else "")
         self.query_one("#steps", Static).update(t)
 
@@ -503,29 +579,56 @@ class DashboardApp(App):
 
     WINDOW_MIN = 5.0          # width of the scrolling chart window, in minutes
 
-    def target_runs(self, lo: float, hi: float):
-        """Planned target power as stair-step runs of (xs, ys), clipped to [lo, hi].
+    def target_runs(self, step, idx: int, remaining: float):
+        """Target power vs. elapsed workout time, as runs of (xs, ys).
 
-        Consecutive watts steps join into one series, so the line also goes
-        vertically at each change. Grade and resistance steps have no wattage,
-        so they split the line into separate runs.
+        History: the target that was actually commanded, sample by sample (so
+        skips, restarts and pauses show up as they happened). Ahead of "now" the
+        line is projected through the remaining TIME-based steps; it stops at the
+        first distance step, whose duration can't be known in advance.
+        Grade/resistance-only steps (no watts) break the line into runs.
         """
         runs, xs, ys = [], [], []
-        for i, s in enumerate(self.plan):
-            a = self.plan_start[i] / 60
-            b = (self.plan_start[i] + s.seconds) / 60
-            if s.watts is None or b <= lo or a >= hi:
+        for x, w in zip(self.hist_t, self.hist_target):
+            if w is None:
                 if xs:
                     runs.append((xs, ys))
                 xs, ys = [], []
-                continue
-            xs += [max(a, lo), min(b, hi)]
-            ys += [s.watts, s.watts]
+            else:
+                xs.append(x)
+                ys.append(w)
+
+        if xs and step is not None and step.watts is not None and not step.is_distance:
+            ex = self.elapsed_s / 60 + max(remaining, 0.0) / 60
+            xs.append(ex)
+            ys.append(step.watts)
+            for nxt in self.plan[idx + 1:]:
+                if nxt.watts is None or nxt.is_distance:
+                    break
+                xs += [ex, ex + nxt.seconds / 60]
+                ys += [nxt.watts, nxt.watts]
+                ex += nxt.seconds / 60
         if xs:
             runs.append((xs, ys))
         return runs
 
-    def render_charts(self, now_min: float) -> None:
+    @staticmethod
+    def _clip(xs, ys, lo: float, hi: float):
+        """Clip a polyline to the x range [lo, hi], interpolating at the edges."""
+        ox, oy = [], []
+        for i, (x, y) in enumerate(zip(xs, ys)):
+            if i:
+                x0, y0 = xs[i - 1], ys[i - 1]
+                for edge in (lo, hi):
+                    if x0 < edge < x or x < edge < x0:
+                        ox.append(edge)
+                        oy.append(y0 + (y - y0) * (edge - x0) / (x - x0))
+            if lo <= x <= hi:
+                ox.append(x)
+                oy.append(y)
+        return ox, oy
+
+    def render_charts(self, now_min: float, step=None, idx: int = 0, remaining: float = 0.0) -> None:
         # EKG-style window: it starts at 0 and the trace grows rightward until
         # it fills the window, then the window slides so "now" stays at the right edge.
         lo = max(0.0, now_min - self.WINDOW_MIN)
@@ -536,13 +639,17 @@ class DashboardApp(App):
             pts = [(x, y) for x, y in zip(xs, ys) if y is not None and x >= lo - 0.05]
             return [p[0] for p in pts], [p[1] for p in pts]
 
-        # Power chart: planned target (orange, drawn first) under live power.
+        # Power chart: target (orange, drawn first) under live power.
         w = self.query_one("#power_plot", PlotextPlot)
         plt = w.plt
         plt.clear_data()
         plt.title("Power (W)")
-        for n, (rx, ry) in enumerate(self.target_runs(lo, hi)):
-            plt.plot(rx, ry, color="orange", marker=marker, label="Target" if n == 0 else None)
+        n = 0
+        for rx, ry in self.target_runs(step, idx, remaining):
+            rx, ry = self._clip(rx, ry, lo, hi)
+            if rx:
+                plt.plot(rx, ry, color="orange", marker=marker, label="Target" if n == 0 else None)
+                n += 1
         xs, ys = visible(self.hist_t, self.hist_power)
         if xs:
             plt.plot(xs, ys, color="green", marker=marker, label="Power")
@@ -604,13 +711,17 @@ class DashboardApp(App):
             csv_file = stack.enter_context(open(self.csv_path, "w", newline=""))
             writer = csv.writer(csv_file)
             writer.writerow(["timestamp", "elapsed_s", "step", "target",
-                             "power_w", "cadence_rpm", "speed_kmh", "hr_bpm"])
+                             "power_w", "cadence_rpm", "speed_kmh", "hr_bpm", "distance_m"])
 
             self.msg("Taking control of the trainer...")
             await trainer.take_control()
             self.msg(f"Logging to {self.csv_path}")
             self.sub_title = "Running"
             scale = self.cli.demo_speed if self.cli.demo else 1.0
+            if self.mode == "mixed":
+                self.msg("Mixed time/distance workout: showing step left only.")
+            elif self.mode == "distance":
+                self.msg("Distance workout: progress is measured from trainer speed.")
 
             try:
                 t0 = time.monotonic()
@@ -621,18 +732,24 @@ class DashboardApp(App):
                         break
                     step = self.plan[idx]
                     self.msg(f"Step {idx + 1}/{len(self.plan)}: {step.name}, "
-                             f"{step.target} for {mmss(step.seconds)}")
+                             f"{step.target} for {step.length_str}")
                     self.skip_requested = False
                     self.reverse_requested = False
                     apply_pending = True          # send the target when not paused
                     move = 1                      # +1 next step, 0 restart, -1 previous
-                    remaining = float(step.seconds)
+                    remaining = float(step.length)  # seconds left, or meters left
+                    step_t = 0.0                  # real seconds spent in this step
                     last = time.monotonic()
 
                     while True:
                         now = time.monotonic()
                         if not self.paused:
-                            remaining -= (now - last) * scale
+                            step_t += now - last
+                            dt = (now - last) * scale        # workout seconds
+                            v = (self.live.get("speed_kmh") or 0.0) / 3.6   # m/s
+                            self.elapsed_s += dt
+                            self.dist_m += v * dt
+                            remaining -= v * dt if step.is_distance else dt
                         last = now
 
                         # Pause / play toggle.
@@ -664,7 +781,8 @@ class DashboardApp(App):
                             apply_pending = False
 
                         left = max(remaining, 0.0)
-                        plan_t = self.plan_start[idx] + step.seconds - left
+                        done = (None if self.mode == "mixed"
+                                else self.unit_start[idx] + step.length - left)
 
                         # Record one sample: CSV row, chart history, screen.
                         d = self.live
@@ -673,14 +791,15 @@ class DashboardApp(App):
                                          "PAUSED" if self.paused else step.target,
                                          d["power"], d["cadence"],
                                          None if d["speed_kmh"] is None else round(d["speed_kmh"], 1),
-                                         d["hr"]])
+                                         d["hr"], round(self.dist_m, 1)])
                         csv_file.flush()
                         if not self.paused:
-                            self.hist_t.append(plan_t / 60)
+                            self.hist_t.append(self.elapsed_s / 60)
+                            self.hist_target.append(step.watts)
                             self.hist_power.append(d["power"])
                             self.hist_hr.append(d["hr"])
                             self.hist_cad.append(d["cadence"])
-                        self.render_all(step, idx, left, plan_t)
+                        self.render_all(step, idx, left, done)
 
                         if lost.is_set():
                             raise ConnectionError("Lost connection to the trainer.")
@@ -692,7 +811,7 @@ class DashboardApp(App):
                         if self.reverse_requested:
                             # Under 2 s into a step: go to the previous one.
                             # Otherwise: restart this one.
-                            if (step.seconds - remaining) / scale < 2.0 and idx > 0:
+                            if step_t < 2.0 and idx > 0:
                                 move = -1
                                 self.msg("Back to the previous step.")
                             else:
@@ -702,7 +821,14 @@ class DashboardApp(App):
                         if remaining <= 0:
                             break
 
-                        timeout = 0.5 if self.paused else max(0.05, min(1.0, remaining / scale))
+                        if self.paused:
+                            timeout = 0.5
+                        elif step.is_distance:
+                            # Wake about when the distance should run out.
+                            speed = max((self.live.get("speed_kmh") or 0.0) / 3.6, 0.5)
+                            timeout = max(0.05, min(1.0, remaining / speed / scale))
+                        else:
+                            timeout = max(0.05, min(1.0, remaining / scale))
                         self.wake.clear()
                         try:
                             await asyncio.wait_for(self.wake.wait(), timeout)
@@ -711,12 +837,6 @@ class DashboardApp(App):
 
                     if self.stop_event.is_set():
                         break
-                    if move <= 0:
-                        # Drop chart history from the part of the plan we're re-doing.
-                        cutoff = self.plan_start[idx + move] / 60
-                        while self.hist_t and self.hist_t[-1] > cutoff:
-                            for h in (self.hist_t, self.hist_power, self.hist_hr, self.hist_cad):
-                                h.pop()
                     idx += move
             finally:
                 # Runs on completion, errors and quitting: release the trainer.
